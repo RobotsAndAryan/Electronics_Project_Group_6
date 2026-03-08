@@ -44,8 +44,8 @@ void draw() {
 
           // HUMAN SENSITIVITY CALIBRATION
           // Constrain to human range: 27C (room) to 34C (skin)
-          float constrained = constrain(val, 27, 34);
-          grid[row][col] = map(constrained, 27, 34, 240, 360); 
+          float constrained = constrain(val, 20, 30);
+          grid[row][col] = map(constrained, 20, 30, 240, 360); 
         }
       }
     }
