@@ -26,9 +26,9 @@
 #define SERVO2_OPEN_ANGLE 0      
 
 // --- EXTERNAL HULL LED PINS ---
-const int led_safe = 2;       // GREEN: Recon Clear
-const int led_hazard = 3;     // RED: Thermal Hazard Detected
-const int led_status = 4;     // BLUE/YELLOW: Active scanning/dropping
+const int led_safe = 2;       
+const int led_hazard = 3;     
+const int led_status = 4;     
 
 // --- SENSOR & ACTUATOR PINS ---
 const int sonar_trig_pin = 5;
@@ -36,9 +36,11 @@ const int sonar_echo_pin = 6;
 const int servo1_pin = 7;        
 const int servo2_pin = 8;        
 
-// --- PRE-FLIGHT UI BUTTONS (Wired to GND) ---
-const int btn_hatch = A1;     // Button 1: Toggle Hatch Open/Closed
-const int btn_launch = A2;    // Button 2: Manual Launch
+// --- PRE-FLIGHT UI BUTTONS ---
+const int btn_hatch = A1;     
+const int btn_launch = A2;    
+
+// --- TRIPLE FSR ARRAY PINS ---
 const int FSR1_pin = A3; 
 const int FSR2_pin = A4; 
 const int FSR3_pin = A5; 
@@ -57,14 +59,17 @@ unsigned int localPort = 2390;
 WiFiUDP Udp;
 GridEYE grideye;
 
-// DUAL SERVO OBJECTS
 Servo hatchServo1; 
 Servo hatchServo2; 
 
 Adafruit_MPU6050 mpu; 
 MotoronI2C mc; 
 
-int fsr_baseline = 0;
+// Independent baselines for all 3 sensors
+int fsr1_baseline = 0;
+int fsr2_baseline = 0;
+int fsr3_baseline = 0;
+
 float dynamic_max_temp = 25.0; 
 bool wifiOnline = false;
 
@@ -73,10 +78,10 @@ float filter_roll = 0.0;
 unsigned long last_udp_tx = 0; 
 unsigned long last_debug_print = 0; 
 
-// Hatch UI State
 bool hatch_is_open = false;
 unsigned long last_hatch_toggle = 0;
 
+// NEW PACKET STRUCTURE: Added 3x uint16_t for FSR data (291 bytes total)
 #pragma pack(push, 1) 
 struct TelemetryPacket {
   uint32_t timestamp;
@@ -86,7 +91,10 @@ struct TelemetryPacket {
   float roll;
   float accel_x;    
   float accel_y;    
-  float accel_z;    
+  float accel_z; 
+  uint16_t fsr1;
+  uint16_t fsr2;
+  uint16_t fsr3;
   float thermal_grid[64];
 } t_packet;
 #pragma pack(pop)
@@ -175,34 +183,37 @@ void setup() {
   while (!Serial && (millis() - t < 3000)); 
   
   Serial.println(F("\n======================================"));
-  Serial.println(F(" ALRS-007 FLIGHT CONTROLLER V2.1"));
+  Serial.println(F(" ALRS-007 TRIPLE FSR ARRAY EDITION"));
   Serial.println(F("======================================"));
 
   clearI2CBus();
   
   hatchServo1.attach(servo1_pin);
   hatchServo2.attach(servo2_pin);
-  // Lock the hatches symmetrically at boot
   hatchServo1.write(SERVO1_LOCKED_ANGLE);
   hatchServo2.write(SERVO2_LOCKED_ANGLE);
   
-  // Initialize External LEDs
   pinMode(led_safe, OUTPUT);
   pinMode(led_hazard, OUTPUT);
   pinMode(led_status, OUTPUT);
   
-  // Initialize Buttons with Internal Pullups
   pinMode(btn_hatch, INPUT_PULLUP);
   pinMode(btn_launch, INPUT_PULLUP);
   
-  // Initialize Sonar Pins (The missing link)
   pinMode(sonar_trig_pin, OUTPUT);
   pinMode(sonar_echo_pin, INPUT);
   
-  Serial.print(F("[BOOT] Calibrating FSR... "));
-  long f_sum = 0;
-  for(int i=0; i<50; i++) { f_sum += analogRead(FSR1_pin); delay(10); }
-  fsr_baseline = f_sum / 50;
+  Serial.print(F("[BOOT] Calibrating Triple FSR Array... "));
+  long f1_sum = 0, f2_sum = 0, f3_sum = 0;
+  for(int i=0; i<50; i++) { 
+    f1_sum += analogRead(FSR1_pin); 
+    f2_sum += analogRead(FSR2_pin); 
+    f3_sum += analogRead(FSR3_pin); 
+    delay(10); 
+  }
+  fsr1_baseline = f1_sum / 50;
+  fsr2_baseline = f2_sum / 50;
+  fsr3_baseline = f3_sum / 50;
   Serial.println(F("OK."));
 
   Wire.begin(); 
@@ -233,7 +244,6 @@ void setup() {
     Wire.beginTransmission(0x68);
     if (Wire.endTransmission() == 0) {
         Serial.println(F("\n[FATAL ERROR] GridEYE is at 0x68! Address Collision with MPU6050!"));
-        Serial.println(F("Fix the hardware ADDR jumper on the GridEYE to 0x69. Halting."));
         while(1);
     } else {
         Serial.println(F("FAILED! Camera not found on bus. Halting."));
@@ -259,7 +269,6 @@ void setup() {
   Udp.begin(localPort);
   Serial.println(F("OK."));
   
-  // Fast flash all LEDs to show boot complete
   for(int i=0; i<3; i++) {
     digitalWrite(led_safe, HIGH); digitalWrite(led_hazard, HIGH); digitalWrite(led_status, HIGH);
     delay(150);
@@ -274,6 +283,11 @@ void setup() {
   
   while (true) {
     if (millis() - last_standby >= 50) { 
+      // Continuously read FSRs for live GCS telemetry
+      t_packet.fsr1 = analogRead(FSR1_pin);
+      t_packet.fsr2 = analogRead(FSR2_pin);
+      t_packet.fsr3 = analogRead(FSR3_pin);
+      
       for(int i=0; i<64; i++) t_packet.thermal_grid[i] = grideye.getPixelTemperature(i);
       t_packet.altitude = read_height_median();
       updateIMU(0); 
@@ -281,7 +295,6 @@ void setup() {
       last_standby = millis();
     }
     
-    // UI: Hatch Toggle
     if (digitalRead(btn_hatch) == LOW) {
       if (millis() - last_hatch_toggle > 500) { 
         hatch_is_open = !hatch_is_open;
@@ -298,13 +311,11 @@ void setup() {
       }
     }
 
-    // UI: Launch Button
     if (digitalRead(btn_launch) == LOW) {
       Serial.println(F("[CMD] MANUAL LAUNCH PRESSED. Proceeding."));
       break; 
     }
     
-    // GCS: UDP Launch
     if (Udp.parsePacket()) {
       int len = Udp.read(in_buf, 15);
       in_buf[len] = 0; 
@@ -388,17 +399,36 @@ void phase2_descent() {
 }
 
 void phase3_impact() {
-  Serial.println(F("\n[STATE 3] Impact Armed. Waiting for strike..."));
+  Serial.println(F("\n[STATE 3] Impact Armed. Waiting for strike on ANY sensor..."));
   digitalWrite(led_status, HIGH);
-  int target = fsr_baseline + IMPACT_THRESHOLD;
-  while (analogRead(FSR1_pin) < target) {
+  
+  bool impact_detected = false;
+  
+  while (!impact_detected) {
+    t_packet.fsr1 = analogRead(FSR1_pin);
+    t_packet.fsr2 = analogRead(FSR2_pin);
+    t_packet.fsr3 = analogRead(FSR3_pin);
+    
+    // REDUNDANT LOGICAL OR GATE: Any single sensor crossing threshold triggers impact
+    if (t_packet.fsr1 > fsr1_baseline + IMPACT_THRESHOLD ||
+        t_packet.fsr2 > fsr2_baseline + IMPACT_THRESHOLD ||
+        t_packet.fsr3 > fsr3_baseline + IMPACT_THRESHOLD) {
+      impact_detected = true;
+    }
+    
     updateIMU(0.01);
     transmitTelemetry(3);
     delay(10);
   }
+  
   Serial.println(F("\n[STATE 4] IMPACT DETECTED! Logging high-speed crash data..."));
   unsigned long impactTime = millis();
   while (millis() - impactTime < POST_IMPACT_LOG_MS) {
+    // Keep reading all 3 FSRs to determine final resting angle
+    t_packet.fsr1 = analogRead(FSR1_pin);
+    t_packet.fsr2 = analogRead(FSR2_pin);
+    t_packet.fsr3 = analogRead(FSR3_pin);
+    
     updateIMU(0.01);
     transmitTelemetry(4);
     delay(SAMPLE_INTERVAL_MS);
