@@ -23,8 +23,8 @@ sock.setblocking(False)
 plt.ion() 
 plt.style.use('dark_background')
 fig = plt.figure(figsize=(14, 9)) 
-fig.canvas.manager.set_window_title('ALRS-007 GCS')
-fig.suptitle('ALRS-007 COMMAND & CONTROL (HYBRID THERMAL)', fontsize=18, fontweight='bold', color='orange', y=0.95)
+fig.canvas.manager.set_window_title('GCS')
+fig.suptitle('Landing Capsule COMMAND & CONTROL', fontsize=18, fontweight='bold', color='orange', y=0.95)
 
 gs = gridspec.GridSpec(2, 3, height_ratios=[1.2, 1], width_ratios=[1, 1, 1], hspace=0.3, wspace=0.3)
 
@@ -32,20 +32,28 @@ gs = gridspec.GridSpec(2, 3, height_ratios=[1.2, 1], width_ratios=[1, 1, 1], hsp
 ax_thermal = fig.add_subplot(gs[0, 0])
 grid_data = np.zeros((8, 8))
 im = ax_thermal.imshow(grid_data, cmap='jet', vmin=20, vmax=35, interpolation='bicubic')
-ax_thermal.set_title("THERMAL RECON (QWIIC)", color='white', fontweight='bold', pad=10)
+ax_thermal.set_title("THERMAL RECON (AMG8833)", color='white', fontweight='bold', pad=10)
 ax_thermal.axis('off')
 
-# Text Overlays for Thermal
 txt_maxtemp = ax_thermal.text(0.05, 0.90, "MAX: --.- C", transform=ax_thermal.transAxes, color='yellow', fontweight='bold', fontsize=12)
 txt_hotspot = ax_thermal.text(0, 0, "", color='white', fontweight='bold', ha='center', va='center', fontsize=10, bbox=dict(facecolor='black', alpha=0.5, edgecolor='none', pad=1))
 
+# 2. AHRS
 ax_att = fig.add_subplot(gs[0, 1])
 ax_att.set_xlim(-90, 90)
 ax_att.set_ylim(-90, 90)
-ax_att.set_title("ATTITUDE (AHRS)", color='gray', fontweight='bold', pad=10)
+ax_att.set_title("ATTITUDE (IMU AHRS)", color='white', fontweight='bold', pad=10)
+ax_att.set_xlabel("Roll (°)", color='gray')
+ax_att.set_ylabel("Pitch (°)", color='gray')
 ax_att.grid(color='#222222', linestyle='-', linewidth=1)
-ax_att.text(0, 0, "IMU OFFLINE\nSENSOR BYPASSED", color='red', fontsize=14, fontweight='bold', ha='center', va='center')
+ax_att.axhline(0, color='white', linewidth=2)
+ax_att.axvline(0, color='gray', linewidth=1, linestyle='--')
+for p in [-60, -40, -20, 20, 40, 60]: ax_att.plot([-15, 15], [p, p], color='gray', linewidth=1)
+circle = plt.Circle((0, 0), 35, color='green', fill=False, linestyle='--', linewidth=2)
+ax_att.add_patch(circle)
+crosshair, = ax_att.plot([0], [0], marker='+', color='red', markersize=20, markeredgewidth=3)
 
+# 3. TELEMETRY
 ax_data = fig.add_subplot(gs[0, 2])
 ax_data.axis('off')
 ax_data.set_title("MISSION TELEMETRY", color='white', fontweight='bold', pad=10)
@@ -53,17 +61,20 @@ ax_data.set_title("MISSION TELEMETRY", color='white', fontweight='bold', pad=10)
 txt_time  = ax_data.text(0.1, 0.9, "T+ 0.0s", fontsize=20, color='white', fontweight='bold')
 txt_state = ax_data.text(0.1, 0.75, "STATE: STANDBY", fontsize=14, color='cyan')
 txt_alt   = ax_data.text(0.1, 0.60, "ALT:   0.0 cm", fontsize=14, color='yellow')
-txt_gforce= ax_data.text(0.1, 0.35, "CDSI METRICS OFFLINE", fontsize=12, color='red')
-txt_fsr   = ax_data.text(0.1, 0.20, "FSR [0, 0, 0]", fontsize=14, color='gray')
+txt_gforce= ax_data.text(0.1, 0.40, "PEAK G: 0.00", fontsize=14, color='gray')
+txt_cdsi  = ax_data.text(0.1, 0.25, "CDSI:   0.000", fontsize=14, color='gray')
+txt_class = ax_data.text(0.1, 0.10, "CLASS:  N/A", fontsize=14, color='gray')
 
+# 4. IMPACT TRACE
 ax_graph = fig.add_subplot(gs[1, :])
-ax_graph.set_title("DYNAMIC IMPACT TRACE (OFFLINE)", color='gray', pad=10, fontweight='bold')
-ax_graph.set_ylabel("Dynamic Magnitude (G)", color='gray')
+ax_graph.set_title("DYNAMIC IMPACT TRACE (ADC RAW G-FORCE)", color='cyan', pad=10, fontweight='bold')
+ax_graph.set_ylabel("Dynamic Magnitude (G)", color='white')
 ax_graph.set_xlabel("Time Since Impact (s)", color='gray')
 ax_graph.grid(True, color='#222222', linestyle='-', linewidth=1)
 ax_graph.set_xlim(0, 5.0) 
 ax_graph.set_ylim(0, 10.0) 
 ax_graph.tick_params(colors='gray')
+line_gforce, = ax_graph.plot([], [], color='cyan', linewidth=2)
 
 btn_ax = fig.add_axes([0.45, 0.02, 0.1, 0.05]) 
 btn_launch = Button(btn_ax, 'LAUNCH', color='#660000', hovercolor='#ff0000')
@@ -72,7 +83,7 @@ btn_launch.label.set_fontweight('bold')
 btn_launch.label.set_color('white')
 
 def send_launch(event):
-    print("\n[UPLINK] Transmitting LAUNCH sequence to capsule...")
+    print("\n[UPLINK] Transmitting LAUNCH sequence...")
     sock.sendto(b"LAUNCH", (CAPSULE_IP, UDP_PORT))
     btn_launch.color = 'green'
     btn_launch.label.set_text("ARMED")
@@ -81,23 +92,15 @@ def send_launch(event):
 btn_launch.on_clicked(send_launch)
 plt.subplots_adjust(bottom=0.12, top=0.88, left=0.05, right=0.95) 
 
-states = {
-    0: "0 - PRE-FLIGHT",
-    1: "1 - RECON", 
-    2: "2 - DESCENT", 
-    3: "3 - ARMED", 
-    4: "4 - CRASH", 
-    5: "5 - SECURE/TOUCHDOWN"
-}
+states = {0: "0 - STANDBY", 1: "1 - RECON", 2: "2 - DESCENT", 3: "3 - ARMED", 4: "4 - CRASH", 5: "5 - SECURE"}
 
 previous_state = 0
 last_debug_print = time.time()
-packets_received = 0
-last_fsr1, last_fsr2, last_fsr3 = 0, 0, 0
+impact_t_data, impact_g_data = [], []
+impact_start_time = None
 
 print("\n======================================")
-print("[*] GCS Online. Hybrid Thermal Anchor Active.")
-print(f"[*] Expected Packet Size: {PACKET_SIZE} bytes")
+print("[*] GCS Online. FSR Trigger + IMU Physics Active.")
 print("======================================\n")
 
 fig.canvas.draw()
@@ -110,89 +113,92 @@ try:
             try:
                 data, addr = sock.recvfrom(1024)
                 latest_data = data
-                packets_received += 1
             except BlockingIOError:
                 break 
                 
-        current_time = time.time()
-        if current_time - last_debug_print > 2.0:
-            if packets_received == 0:
-                print(f"[WARNING] No telemetry received. Connect to '{CAPSULE_IP}'.")
-            else:
-                print(f"[STATUS] Telemetry Link Active. FSR Base: [{last_fsr1}, {last_fsr2}, {last_fsr3}]")
-                packets_received = 0
-            last_debug_print = current_time
-            
         if latest_data and len(latest_data) == PACKET_SIZE:
             unpacked = struct.unpack(PACKET_FORMAT, latest_data)
             
             timestamp_ms = unpacked[0]
             state_id = unpacked[1]
             altitude = unpacked[2]
-            
-            last_fsr1 = unpacked[8]
-            last_fsr2 = unpacked[9]
-            last_fsr3 = unpacked[10]
-            
+            pitch = unpacked[3]
+            roll = unpacked[4]
+            ax = unpacked[5]
+            ay = unpacked[6]
+            az = unpacked[7]
             thermal_flat = unpacked[11:]
             
-            # --- THERMAL UI UPDATES (HYBRID ANCHOR PATCH) ---
+            # 1. Thermal UI
             thermal_matrix = np.array(thermal_flat).reshape((8, 8))
-            
-            # 1. Fix Spatial Inversion
             thermal_matrix = np.fliplr(thermal_matrix)
-            
-            # 2. Filter garbage data
             thermal_matrix = np.clip(thermal_matrix, 0, 150) 
-            
             current_max = np.max(thermal_matrix)
             
-            # 3. HYBRID SCALING: Floor is locked to 20C. Ceiling stretches to fit the hottest object, but never drops below 28C.
-            visual_floor = 20.0
-            visual_ceiling = max(28.0, current_max)
-            im.set_clim(visual_floor, visual_ceiling)
+            im.set_clim(20.0, max(28.0, current_max))
             im.set_data(thermal_matrix)
-            
-            # 4. RAW NUMBER OVERLAY: Print the exact temperature on the hottest pixel
             max_idx = np.unravel_index(np.argmax(thermal_matrix), thermal_matrix.shape)
-            txt_hotspot.set_position((max_idx[1], max_idx[0])) # x, y
+            txt_hotspot.set_position((max_idx[1], max_idx[0])) 
             txt_hotspot.set_text(f"{current_max:.1f}")
-            
             txt_maxtemp.set_text(f"MAX: {current_max:.1f} C")
-            if current_max > 30.0: txt_maxtemp.set_color('red')
-            else: txt_maxtemp.set_color('yellow')
-            # ----------------------------------------------
+            txt_maxtemp.set_color('red' if current_max > 30.0 else 'yellow')
 
-            state_str = states.get(state_id, "ERR")
-            txt_state.set_text(f"STATE: {state_str}")
-            
-            alt_color = 'yellow' if altitude > 50.0 else 'red'
+            # 2. AHRS UI
+            crosshair.set_data([roll], [pitch])
+            crosshair.set_color('red' if abs(pitch) > 35 or abs(roll) > 35 else 'lime')
+
+            # 3. Telemetry Text
+            txt_state.set_text(f"STATE: {states.get(state_id, 'ERR')}")
             txt_alt.set_text(f"ALT:   {altitude:.1f} cm")
-            txt_alt.set_color(alt_color)
-            
+            txt_alt.set_color('yellow' if altitude > 50.0 else 'red')
             txt_time.set_text(f"T+ {timestamp_ms/1000.0:.1f}s")
-            txt_fsr.set_text(f"FSR [{last_fsr1}, {last_fsr2}, {last_fsr3}]")
             
+            # 4. IMU IMPACT TRACING
+            if state_id == 4:
+                if impact_start_time is None:
+                    impact_start_time = timestamp_ms / 1000.0
+                rel_t = (timestamp_ms / 1000.0) - impact_start_time
+                
+                # Convert raw m/s^2 to G-Force, subtract 1G resting gravity to get dynamic impact
+                total_g = np.sqrt(ax**2 + ay**2 + az**2) / 9.81
+                dynamic_g = abs(total_g - 1.0) 
+                
+                impact_t_data.append(rel_t)
+                impact_g_data.append(dynamic_g)
+                line_gforce.set_data(impact_t_data, impact_g_data)
+                
+                if dynamic_g > ax_graph.get_ylim()[1]:
+                    ax_graph.set_ylim(0, dynamic_g + 2.0)
+
+            # 5. CDSI POST-FLIGHT ANALYSIS
             if previous_state == 4 and state_id >= 5:
-                print("\n" + "="*45)
-                print(">>> POST-CRASH ANALYSIS COMPLETE <<<")
-                
-                fsr_vals = [last_fsr1, last_fsr2, last_fsr3]
-                max_fsr = max(fsr_vals)
-                min_fsr = min(fsr_vals)
-                
-                if (max_fsr - min_fsr) > 250:
-                    print(f"[!] WARNING: ASYMMETRIC LANDING DETECTED [!]")
-                    print(f"    Resting Load Spread: {fsr_vals}")
-                    print(f"    Capsule is resting at a severe angle.")
-                    txt_fsr.set_color('red')
-                else:
-                    print(f"[OK] Symmetric Landing Confirmed.")
-                    print(f"    Resting Load Spread: {fsr_vals}")
-                    txt_fsr.set_color('lime')
+                if len(impact_t_data) > 1:
+                    peak_g = np.max(impact_g_data)
+                    G_safe = 5.0 # From Chapter 2
+                    S_new = peak_g / G_safe
                     
-                print("=============================================\n")
-                
+                    if S_new <= 1.0:
+                        classification, c_color = "SOFT", 'lime'
+                    elif S_new <= 1.5:
+                        classification, c_color = "MARGINAL", 'yellow'
+                    else:
+                        classification, c_color = "HARD", 'red'
+                        
+                    txt_gforce.set_color('white')
+                    txt_gforce.set_text(f"PEAK G: {peak_g:.2f}")
+                    txt_cdsi.set_text(f"CDSI:   {S_new:.3f}")
+                    txt_cdsi.set_color('white')
+                    txt_class.set_text(f"CLASS:  {classification}")
+                    txt_class.set_color(c_color)
+                    line_gforce.set_color(c_color)
+                    
+                    print("\n" + "="*45)
+                    print(">>> IMU POST-CRASH ANALYSIS COMPLETE <<<")
+                    print(f"Peak Dynamic G:   {peak_g:.2f} G")
+                    print(f"CDSI Score:       {S_new:.3f}")
+                    print(f"Classification:   {classification}")
+                    print("="*45 + "\n")
+                    
             previous_state = state_id
             
         fig.canvas.flush_events()
