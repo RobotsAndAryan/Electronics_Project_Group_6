@@ -5,292 +5,371 @@
 #include <WiFiS3.h>
 #include <WiFiUdp.h>
 
-#define MIN_TEMP 10.0           
-#define TEMP_HAZARD_OFFSET 6.0  
-#define CHUTE_HEIGHT 50.0       
-#define IMPACT_THRESHOLD 300    
-#define POST_IMPACT_LOG_MS 5000 
-#define SAMPLE_INTERVAL_MS 10   
-#define POST_FLIGHT_IDLE_MS 10000 
+// threshold variables
+float minTemp = 10.0;           
+float tempHazardOffset = 6.0;  
+float chuteHeight = 50.0;       
+int impactThreshold = 300;    
+int postCrashTime = 5000; 
+int idleTime = 10000; 
 
-// --- EXTERNAL HULL LED PINS ---
-const int led_safe = 2;       
-const int led_hazard = 3;     
-const int led_status = 4;     
+// LED pins on the outside
+int ledSafe = 2;       
+int ledHazard = 3;     
+int ledStatus = 4;     
 
-// --- SENSOR PINS ---
-const int sonar_trig_pin = 5;
-const int sonar_echo_pin = 6;
-const int FSR1_pin = A3; 
-const int FSR2_pin = A4; 
-const int FSR3_pin = A5; 
+// sensor pins
+int trigPin = 5;
+int echoPin = 6;
+int fsr1Pin = A3; 
+int fsr2Pin = A4; 
+int fsr3Pin = A5; 
 
-float sonar_buffer[5] = {999.0, 999.0, 999.0, 999.0, 999.0};
-int sonar_idx = 0;
+// array to hold previous sonar readings for filtering
+float sonarArray[5] = {999.0, 999.0, 999.0, 999.0, 999.0};
+int sIndex = 0;
 
-char ssid[] = "capsule_wifi";
-char pass[] = "sxpn2655"; 
-IPAddress broadcastIP(255, 255, 255, 255); 
-unsigned int localPort = 2390;
+char mySSID[] = "capsule_wifi";
+char myPass[] = "sxpn2655"; 
+IPAddress targetIP(255, 255, 255, 255); // broadcast 
+unsigned int udpPort = 2390;
 
-WiFiUDP Udp;
-GridEYE grideye;
-Adafruit_MPU6050 mpu;
-uint8_t grideye_address = 0x69; // Assumes IMU is 0x68
+WiFiUDP myUDP;
+GridEYE thermalCam;
+Adafruit_MPU6050 myIMU;
+int camAddress = 0x69; // IMU is 0x68 so we made camera 69
 
-int fsr1_baseline = 0;
-int fsr2_baseline = 0;
-int fsr3_baseline = 0;
+int baseFSR1 = 0;
+int baseFSR2 = 0;
+int baseFSR3 = 0;
 
-float dynamic_max_temp = 25.0; 
-bool wifiOnline = false;
+float dynamicMaxTemp = 25.0; 
+bool isWifiConnected = false;
 
-unsigned long last_udp_tx = 0; 
-unsigned long last_debug_print = 0; 
-unsigned long last_serial_sync = 0;
+unsigned long lastUdpSend = 0; 
+unsigned long lastDebugPrint = 0; 
+unsigned long lastSerialSync = 0;
 
+// this struct has to match the python code exactly
 #pragma pack(push, 1) 
-struct TelemetryPacket {
-  uint32_t timestamp;
-  uint8_t state; 
-  float altitude;
-  float pitch;      
-  float roll;       
-  float accel_x;    
-  float accel_y;    
-  float accel_z;    
-  uint16_t fsr1;
-  uint16_t fsr2;
-  uint16_t fsr3;
-  float thermal_grid[64];
-} t_packet;
+struct CapsuleData {
+  uint32_t time_ms;
+  uint8_t currentState; 
+  float currentAlt;
+  float pitchAngle;      
+  float rollAngle;       
+  float ax;    
+  float ay;    
+  float az;    
+  uint16_t force1;
+  uint16_t force2;
+  uint16_t force3;
+  float thermalPixels[64];
+} sensorData;
 #pragma pack(pop)
 
-void scanThermalGrid() {
-  for(int i = 0; i < 64; i++) { 
-    t_packet.thermal_grid[i] = grideye.getPixelTemperature(i); 
+void updateThermal() {
+  // loop through all 64 pixels
+  for(int i=0; i<64; i++) { 
+    sensorData.thermalPixels[i] = thermalCam.getPixelTemperature(i); 
   }
 }
 
-void scanIMU() {
+void updateIMU() {
   sensors_event_t a, g, temp;
-  mpu.getEvent(&a, &g, &temp);
+  myIMU.getEvent(&a, &g, &temp);
   
-  t_packet.accel_x = a.acceleration.x;
-  t_packet.accel_y = a.acceleration.y;
-  t_packet.accel_z = a.acceleration.z;
+  sensorData.ax = a.acceleration.x;
+  sensorData.ay = a.acceleration.y;
+  sensorData.az = a.acceleration.z;
   
-  // Basic Pitch/Roll estimation from gravity vector
-  t_packet.pitch = -(atan2(a.acceleration.x, sqrt(a.acceleration.y*a.acceleration.y + a.acceleration.z*a.acceleration.z))*180.0)/PI;
-  t_packet.roll = (atan2(a.acceleration.y, a.acceleration.z)*180.0)/PI;
+  // calculate pitch and roll using gravity maths
+  sensorData.pitchAngle = -(atan2(a.acceleration.x, sqrt(a.acceleration.y*a.acceleration.y + a.acceleration.z*a.acceleration.z))*180.0)/PI;
+  sensorData.rollAngle = (atan2(a.acceleration.y, a.acceleration.z)*180.0)/PI;
 }
 
-void transmitTelemetry(uint8_t currentState) {
-  if (millis() - last_serial_sync >= 100) {
-    Serial1.write(currentState);
-    last_serial_sync = millis();
+void sendTelemetryData(uint8_t stateNow) {
+  // talk to the motor controller via serial
+  if (millis() - lastSerialSync >= 100) {
+    Serial1.write(stateNow);
+    lastSerialSync = millis();
   }
 
-  if (!wifiOnline) return;
-  static uint8_t last_tx_state = 255;
+  if (isWifiConnected == false) {
+    return;
+  }
   
-  // High speed UDP tx in impact state, else 50ms
-  int tx_interval = (currentState == 4) ? 5 : 50; 
+  static uint8_t previousState = 255;
   
-  if (currentState != last_tx_state || (millis() - last_udp_tx >= tx_interval)) {
-    t_packet.timestamp = millis();
-    t_packet.state = currentState;
-    Udp.beginPacket(broadcastIP, localPort);
-    Udp.write((uint8_t*)&t_packet, sizeof(TelemetryPacket)); 
-    Udp.endPacket();
+  // send data faster if we are crashing
+  int sendDelay;
+  if (stateNow == 4) {
+    sendDelay = 5;
+  } else {
+    sendDelay = 50;
+  }
+  
+  if (stateNow != previousState || (millis() - lastUdpSend >= sendDelay)) {
+    sensorData.time_ms = millis();
+    sensorData.currentState = stateNow;
     
-    if (millis() - last_debug_print > 500) {
-       Serial.print(F("[TX] -> UDP | State: ")); 
-       Serial.print(currentState);
-       Serial.print(F(" | Z-Accel: "));
-       Serial.println(t_packet.accel_z);
-       last_debug_print = millis();
+    myUDP.beginPacket(targetIP, udpPort);
+    myUDP.write((uint8_t*)&sensorData, sizeof(CapsuleData)); 
+    myUDP.endPacket();
+    
+    // debug print every half second
+    if (millis() - lastDebugPrint > 500) {
+       Serial.print("Sending UDP... State: "); 
+       Serial.print(stateNow);
+       Serial.print(" | Z-Accel: ");
+       Serial.println(sensorData.az);
+       lastDebugPrint = millis();
     }
-    last_udp_tx = millis();
-    last_tx_state = currentState;
+    lastUdpSend = millis();
+    previousState = stateNow;
   }
 }
 
-float get_raw_height() {
-  digitalWrite(sonar_trig_pin, LOW); delayMicroseconds(5);
-  digitalWrite(sonar_trig_pin, HIGH); delayMicroseconds(10);
-  digitalWrite(sonar_trig_pin, LOW);
-  long duration = pulseIn(sonar_echo_pin, HIGH, 25000); 
-  if (duration == 0) return 999.0; 
+float getSonarDistance() {
+  digitalWrite(trigPin, LOW); 
+  delayMicroseconds(5);
+  digitalWrite(trigPin, HIGH); 
+  delayMicroseconds(10);
+  digitalWrite(trigPin, LOW);
+  
+  long duration = pulseIn(echoPin, HIGH, 25000); 
+  if (duration == 0) {
+    return 999.0; // out of range
+  }
   return (duration * 0.0343) / 2.0;
 }
 
-float read_height_median() {
-  sonar_buffer[sonar_idx] = get_raw_height();
-  sonar_idx = (sonar_idx + 1) % 5;
+float getFilteredAltitude() {
+  sonarArray[sIndex] = getSonarDistance();
+  sIndex = sIndex + 1;
+  if (sIndex > 4) {
+    sIndex = 0;
+  }
+  
+  // copy array so we dont mess up the original one
   float sorted[5];
-  memcpy(sorted, sonar_buffer, sizeof(sonar_buffer));
-  for (int i = 0; i < 4; i++) {
-    for (int j = 0; j < 4 - i; j++) {
+  for(int k=0; k<5; k++){
+    sorted[k] = sonarArray[k];
+  }
+  
+  // basic bubble sort to find the median
+  for (int i=0; i<4; i++) {
+    for (int j=0; j<4-i; j++) {
       if (sorted[j] > sorted[j+1]) {
-        float temp = sorted[j]; sorted[j] = sorted[j+1]; sorted[j+1] = temp;
+        float tempVal = sorted[j]; 
+        sorted[j] = sorted[j+1]; 
+        sorted[j+1] = tempVal;
       }
     }
   }
-  return sorted[2]; 
+  return sorted[2]; // middle value
 }
 
 void setup() {
   Serial.begin(115200);   
   Serial1.begin(115200);  
   
-  unsigned long t = millis();
-  while (!Serial && (millis() - t < 3000)); 
+  delay(2000); // give serial time to start
   
-  Serial.println(F("\n======================================"));
-  Serial.println(F(" ALRS-007 MAIN BRAIN (FULL PHYSICS)"));
-  Serial.println(F("======================================"));
+  Serial.println("---------------------------------");
+  Serial.println(" ALRS-007 Main Computer Starting");
+  Serial.println("---------------------------------");
 
-  pinMode(led_safe, OUTPUT); pinMode(led_hazard, OUTPUT); pinMode(led_status, OUTPUT);
-  pinMode(sonar_trig_pin, OUTPUT); pinMode(sonar_echo_pin, INPUT);
+  pinMode(ledSafe, OUTPUT); 
+  pinMode(ledHazard, OUTPUT); 
+  pinMode(ledStatus, OUTPUT);
+  pinMode(trigPin, OUTPUT); 
+  pinMode(echoPin, INPUT);
 
   Wire.begin(); 
   
-  Serial.print(F("[BOOT] Initializing MPU6050 IMU... "));
-  if (!mpu.begin(0x68, &Wire)) {
-    Serial.println(F("FAILED! Halting."));
-    while (1);
+  Serial.print("Starting IMU... ");
+  if (!myIMU.begin(0x68, &Wire)) {
+    Serial.println("Failed! Check wiring.");
+    while (1){} // stuck here
   }
-  mpu.setAccelerometerRange(MPU6050_RANGE_16_G);
-  Serial.println(F("OK. (0x68)"));
+  myIMU.setAccelerometerRange(MPU6050_RANGE_16_G);
+  Serial.println("Done.");
 
-  Serial.print(F("[BOOT] Initializing Thermal Camera... "));
-  grideye.begin(grideye_address, Wire);
-  Serial.println(F("OK."));
+  Serial.print("Starting Thermal Camera... ");
+  thermalCam.begin(camAddress, Wire);
+  Serial.println("Done.");
 
-  Serial.print(F("[BOOT] Calibrating FSR Array... "));
-  long f1_sum = 0, f2_sum = 0, f3_sum = 0;
+  Serial.print("Getting FSR baseline values... ");
+  long f1 = 0;
+  long f2 = 0;
+  long f3 = 0;
   for(int i=0; i<50; i++) { 
-    f1_sum += analogRead(FSR1_pin); f2_sum += analogRead(FSR2_pin); f3_sum += analogRead(FSR3_pin); 
+    f1 = f1 + analogRead(fsr1Pin); 
+    f2 = f2 + analogRead(fsr2Pin); 
+    f3 = f3 + analogRead(fsr3Pin); 
     delay(10); 
   }
-  fsr1_baseline = f1_sum / 50; fsr2_baseline = f2_sum / 50; fsr3_baseline = f3_sum / 50;
-  Serial.println(F("OK."));
+  baseFSR1 = f1 / 50; 
+  baseFSR2 = f2 / 50; 
+  baseFSR3 = f3 / 50;
+  Serial.println("Done.");
 
-  Serial.print(F("[BOOT] Starting WiFi AP... "));
-  if (WiFi.beginAP(ssid, pass) != WL_AP_LISTENING) while (true);
+  Serial.print("Setting up wifi access point... ");
+  if (WiFi.beginAP(mySSID, myPass) != WL_AP_LISTENING) {
+    while (true); // stuck
+  }
   delay(2000); 
-  wifiOnline = true;
-  Udp.begin(localPort);
-  Serial.println(F("OK."));
+  isWifiConnected = true;
+  myUDP.begin(udpPort);
+  Serial.println("Wifi is ready.");
   
-  Serial.println(F("\n[STATUS] ENTERING STATE 0: PRE-FLIGHT STANDBY"));
-  unsigned long last_standby = 0;
-  char in_buf[16];
+  Serial.println("System is in STATE 0 (Standby). Waiting for launch command...");
+  unsigned long standbyTimer = 0;
+  char packetBuffer[16];
   
   while (true) {
-    if (millis() - last_standby >= 50) { 
-      t_packet.fsr1 = analogRead(FSR1_pin); t_packet.fsr2 = analogRead(FSR2_pin); t_packet.fsr3 = analogRead(FSR3_pin);
-      scanThermalGrid(); 
-      scanIMU();
-      t_packet.altitude = read_height_median();
-      transmitTelemetry(0); 
-      last_standby = millis();
+    if (millis() - standbyTimer >= 50) { 
+      sensorData.force1 = analogRead(fsr1Pin); 
+      sensorData.force2 = analogRead(fsr2Pin); 
+      sensorData.force3 = analogRead(fsr3Pin);
+      updateThermal(); 
+      updateIMU();
+      sensorData.currentAlt = getFilteredAltitude();
+      
+      sendTelemetryData(0); 
+      standbyTimer = millis();
     }
     
-    if (Serial1.available() > 0 && Serial1.read() == 0xAA) {
-      Serial.println(F("[CMD] MANUAL LAUNCH RECEIVED. Proceeding."));
-      break;
+    // check if physical button was pressed on motor board
+    if (Serial1.available() > 0) {
+      if (Serial1.read() == 0xAA) {
+        Serial.println("Launch button pressed!");
+        break;
+      }
     }
-    if (Udp.parsePacket()) {
-      int len = Udp.read(in_buf, 15);
-      in_buf[len] = 0; 
-      if (strcmp(in_buf, "LAUNCH") == 0) {
-        Serial.println(F("[CMD] REMOTE LAUNCH RECEIVED. Proceeding."));
+    // check if UDP command was sent from python
+    if (myUDP.parsePacket()) {
+      int packetLen = myUDP.read(packetBuffer, 15);
+      packetBuffer[packetLen] = 0; 
+      String received = String(packetBuffer);
+      if (received == "LAUNCH") {
+        Serial.println("Remote launch command received!");
         break; 
       }
     }
   }
 }
 
-bool phase1_recon() {
-  Serial.println(F("\n[STATE 1] Thermal Recon Active"));
-  digitalWrite(led_status, HIGH); digitalWrite(led_safe, LOW); digitalWrite(led_hazard, LOW);
+bool doReconPhase() {
+  Serial.println("--- STATE 1: Thermal Scan ---");
+  digitalWrite(ledStatus, HIGH); 
+  digitalWrite(ledSafe, LOW); 
+  digitalWrite(ledHazard, LOW);
   
-  scanThermalGrid(); scanIMU();
-  t_packet.altitude = read_height_median();
-  transmitTelemetry(1);
+  updateThermal(); 
+  updateIMU();
+  sensorData.currentAlt = getFilteredAltitude();
+  sendTelemetryData(1);
   
-  // Standard recon logic skipped for brevity - assume clear
-  Serial.println(F("[STATUS] Recon Clear. Commencing 3-second drop warning..."));
-  digitalWrite(led_status, LOW); digitalWrite(led_safe, HIGH); 
+  Serial.println("Ground looks safe. Dropping in 3 seconds...");
+  digitalWrite(ledStatus, LOW); 
+  digitalWrite(ledSafe, HIGH); 
   delay(5000); 
   
-  for(int i = 3; i > 0; i--) { Serial.print(F("Dropping in ")); Serial.println(i); transmitTelemetry(1); delay(1000); }
-  digitalWrite(led_safe, LOW); 
+  for(int i=3; i>0; i--) { 
+    Serial.print(i); 
+    Serial.println("..."); 
+    sendTelemetryData(1); 
+    delay(1000); 
+  }
+  digitalWrite(ledSafe, LOW); 
   return true;
 }
 
-void phase2_descent() {
-  Serial.println(F("\n[STATE 2] Free-Fall Descent"));
-  digitalWrite(led_status, HIGH); 
+void doDescentPhase() {
+  Serial.println("--- STATE 2: Falling ---");
+  digitalWrite(ledStatus, HIGH); 
+  
   while (true) {
-    float alt = read_height_median();
-    t_packet.altitude = alt;
-    scanIMU();
-    transmitTelemetry(2); 
-    if (alt < CHUTE_HEIGHT && alt > 5.0) break; 
+    float alt = getFilteredAltitude();
+    sensorData.currentAlt = alt;
+    updateIMU();
+    sendTelemetryData(2); 
+    
+    if (alt < chuteHeight && alt > 5.0) {
+      break; 
+    }
     delay(20);
   }
-  Serial.println(F("[ACTION] Sending DEPLOY command to Sub-Board!"));
-  transmitTelemetry(2); 
+  
+  Serial.println("Deploying parachutes now!");
+  sendTelemetryData(2); 
   delay(1000); 
-  digitalWrite(led_status, LOW);
+  digitalWrite(ledStatus, LOW);
 }
 
-void phase3_impact() {
-  Serial.println(F("\n[STATE 3] Impact Armed... Waiting for FSR Interrupt"));
-  digitalWrite(led_status, HIGH);
-  bool impact_detected = false;
+void doImpactPhase() {
+  Serial.println("--- STATE 3: Armed, waiting to hit ground ---");
+  digitalWrite(ledStatus, HIGH);
+  bool crashed = false;
   
-  // FSR as Hardware-Style Trigger Loop
-  while (!impact_detected) {
-    t_packet.fsr1 = analogRead(FSR1_pin); t_packet.fsr2 = analogRead(FSR2_pin); t_packet.fsr3 = analogRead(FSR3_pin);
-    if (t_packet.fsr1 > fsr1_baseline + IMPACT_THRESHOLD || t_packet.fsr2 > fsr2_baseline + IMPACT_THRESHOLD || t_packet.fsr3 > fsr3_baseline + IMPACT_THRESHOLD) {
-      impact_detected = true;
+  // wait until the FSR gets pressed hard
+  while (crashed == false) {
+    sensorData.force1 = analogRead(fsr1Pin); 
+    sensorData.force2 = analogRead(fsr2Pin); 
+    sensorData.force3 = analogRead(fsr3Pin);
+    
+    if (sensorData.force1 > baseFSR1 + impactThreshold || 
+        sensorData.force2 > baseFSR2 + impactThreshold || 
+        sensorData.force3 > baseFSR3 + impactThreshold) {
+      crashed = true;
     }
-    scanIMU();
-    transmitTelemetry(3); delay(5);
+    updateIMU();
+    sendTelemetryData(3); 
+    delay(5);
   }
   
-  Serial.println(F("\n[STATE 4] IMPACT DETECTED! High-Speed IMU Buffering..."));
-  unsigned long impactTime = millis();
+  Serial.println("--- STATE 4: HIT THE GROUND ---");
+  Serial.println("Recording IMU data really fast...");
+  unsigned long timeHit = millis();
   
-  // FSR triggered it, IMU records it.
-  while (millis() - impactTime < POST_IMPACT_LOG_MS) {
-    t_packet.fsr1 = analogRead(FSR1_pin); t_packet.fsr2 = analogRead(FSR2_pin); t_packet.fsr3 = analogRead(FSR3_pin);
-    scanIMU();
-    transmitTelemetry(4); 
-    delay(2); // Pump UDP as fast as possible for graph resolution
+  while (millis() - timeHit < postCrashTime) {
+    sensorData.force1 = analogRead(fsr1Pin); 
+    sensorData.force2 = analogRead(fsr2Pin); 
+    sensorData.force3 = analogRead(fsr3Pin);
+    updateIMU();
+    sendTelemetryData(4); 
+    delay(2); // delay 2ms so we get lots of data points for the graph
   }
-  digitalWrite(led_status, LOW);
+  digitalWrite(ledStatus, LOW);
 }
 
-void phase4_recovery() {
-  Serial.println(F("\n[STATE 5] Touchdown Secure."));
-  digitalWrite(led_status, HIGH);
-  unsigned long secureStart = millis();
-  while (millis() - secureStart < POST_FLIGHT_IDLE_MS) { scanIMU(); transmitTelemetry(5); delay(100); }
-  digitalWrite(led_status, LOW);
+void doRecoveryPhase() {
+  Serial.println("--- STATE 5: Done ---");
+  digitalWrite(ledStatus, HIGH);
+  unsigned long timer = millis();
+  while (millis() - timer < idleTime) { 
+    updateIMU(); 
+    sendTelemetryData(5); 
+    delay(100); 
+  }
+  digitalWrite(ledStatus, LOW);
 }
 
 void loop() {
-  if (phase1_recon()) {
-    phase2_descent(); phase3_impact(); phase4_recovery();
-    Serial.println(F("\n[SYSTEM] Mission Complete. Resetting..."));
-    unsigned long resetStart = millis();
-    while(millis() - resetStart < 5000) { transmitTelemetry(5); delay(100); }
-    NVIC_SystemReset(); 
+  if (doReconPhase()) {
+    doDescentPhase(); 
+    doImpactPhase(); 
+    doRecoveryPhase();
+    
+    Serial.println("Mission is over. Restarting system...");
+    unsigned long t = millis();
+    while(millis() - t < 5000) { 
+      sendTelemetryData(5); 
+      delay(100); 
+    }
+    NVIC_SystemReset(); // resets the arduino
   } else {
     while(1) { delay(100); }
   }
